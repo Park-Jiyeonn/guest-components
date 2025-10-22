@@ -19,11 +19,32 @@ use std::{
         fd::{AsFd, AsRawFd},
         unix::fs::PermissionsExt,
     },
-    path::Path,
+    path::{Component, Path, PathBuf},
 };
 use tokio::{fs, io::AsyncRead};
 use tokio_tar::ArchiveBuilder;
 use xattr::FileExt;
+
+use thiserror::Error;
+#[derive(Error, Debug)]
+pub enum UnpackError {
+    #[error("Failed to unpack layer to destination")]
+    UnpackFailed {
+        #[source]
+        source: io::Error,
+    },
+    
+    #[error("Failed to read entries from the tar")]
+    ReadTarEntriesFailed {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("hard link listed but no link name found for {entry_path:?}")]
+    HardLinkNameMissing {
+        entry_path: std::path::PathBuf,
+    },
+}
 
 // TODO: Add unit tests for both xattr supporting case and
 // non-supporting case.
@@ -113,6 +134,7 @@ pub async fn unpack<R: AsyncRead + Unpin>(input: R, destination: &Path) -> Resul
         .context("failed to read entries from the tar")?;
 
     let mut dirs: HashMap<CString, [timeval; 2]> = HashMap::default();
+    let mut deferred_hardlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
     while let Some(file) = entries.next().await {
         let mut file = file?;
 
@@ -133,9 +155,44 @@ pub async fn unpack<R: AsyncRead + Unpin>(input: R, destination: &Path) -> Resul
             .try_into()
             .context("GID is too large!")?;
         let mode = file.header().mode().ok();
+        let kind = file.header().entry_type();
 
         if attr_available && is_whiteout(entry_name) {
             convert_whiteout(entry_name, &entry_path, uid, gid, mode, destination).await?;
+            continue;
+        }
+
+        if kind.is_hard_link() {
+            let Some(rel_dst) = clean_relative(&entry_path) else {
+                continue;
+            };
+            let dst_abs = destination.join(&rel_dst);
+
+            let link_name = file
+                .link_name()
+                .map_err(|source| UnpackError::ReadTarEntriesFailed { source })?
+                .ok_or_else(|| UnpackError::HardLinkNameMissing {
+                    entry_path: entry_path.to_path_buf(),
+                })?;
+            let link_rel = if link_name.is_absolute() {
+                link_name
+                    .strip_prefix("/")
+                    .unwrap_or(link_name.as_ref())
+                    .to_path_buf()
+            } else {
+                link_name.into_owned()
+            };
+
+            match link_within_root(&link_rel, &dst_abs, destination).await {
+                Ok(()) => {
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    deferred_hardlinks.push((link_rel, dst_abs));
+                }
+                Err(e) => {
+                    return Err(UnpackError::UnpackFailed { source: e }.into());
+                }
+            }
             continue;
         }
 
@@ -149,7 +206,6 @@ pub async fn unpack<R: AsyncRead + Unpin>(input: R, destination: &Path) -> Resul
 
         let file_path = path.to_str().expect("must be utf8");
 
-        let kind = file.header().entry_type();
         let mtime = file.header().mtime()? as i64;
 
         // krata-tokio-tar crate does not provide a way to preserve permissions
@@ -204,6 +260,35 @@ pub async fn unpack<R: AsyncRead + Unpin>(input: R, destination: &Path) -> Resul
     }
 
     Ok(())
+}
+
+fn clean_relative(p: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => return None,
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    if out.as_os_str().is_empty() { None } else { Some(out) }
+}
+
+async fn link_within_root(src_rel: &Path, dst_abs: &Path, root: &Path) -> io::Result<()> {
+    let Some(src_rel_norm) = clean_relative(src_rel) else {
+        return Err(io::Error::new(io::ErrorKind::Other, "invalid hardlink target"));
+    };
+    let src_abs = root.join(&src_rel_norm);
+    if !src_abs.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "hardlink target escapes destination",
+        ));
+    }
+    if let Some(parent) = dst_abs.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::hard_link(&src_abs, dst_abs).await
 }
 
 enum ChownType {
